@@ -1,0 +1,78 @@
+name: Report Top10
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install requests
+
+      - name: Build & send Top10
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ vars.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ vars.TELEGRAM_CHAT_ID }}
+          SEARCH_AUTHORS: ${{ vars.SEARCH_AUTHORS }}
+        run: |
+          python - <<'PY'
+          import os, json, re, requests
+          from urllib.parse import quote
+          STATE = "state.json"
+          if not os.path.exists(STATE):
+              print("No state.json found. Run Hen Watch first.")
+              raise SystemExit(0)
+
+          with open(STATE, "r", encoding="utf-8") as f:
+              state = json.load(f)
+
+          authors_env = os.getenv("SEARCH_AUTHORS", "")
+          authors = [a.strip() for a in re.split(r"[,，、\n\r]+", authors_env) if a.strip()]
+          if not authors:
+              authors = sorted((state.get("authors") or {}).keys())
+
+          def a_url(name: str) -> str:
+              return f"https://e-hentai.org/?f_search={quote(name)}"
+
+          parts = ["🧪 当前前 10 条（按页面顺序）"]
+          total = 0
+          for name in authors:
+              snap = (state.get("authors") or {}).get(name) or {}
+              items = snap.get("items") or []
+              if not items:
+                  continue
+              parts.append(f"\n【{name}】 {a_url(name)}")
+              for it in items[:10]:
+                  parts.append(f"- {it.get('title','(no title)')} {it.get('url','')}")
+                  total += 1
+
+          msg = "🧪 没有可展示的条目（可能尚未建立基线）。" if total == 0 else "\n".join(parts)
+
+          MAX = 4000
+          token = os.getenv("TELEGRAM_BOT_TOKEN")
+          chat  = os.getenv("TELEGRAM_CHAT_ID")
+          if not token or not chat:
+              print("Telegram token/chat_id missing.")
+              raise SystemExit(0)
+
+          url = f"https://api.telegram.org/bot{token}/sendMessage"
+          while msg:
+              part = msg[:MAX]
+              cut = part.rfind("\n")
+              send = part[:cut] if 0 < cut < MAX else part
+              requests.post(url, json={"chat_id": chat, "text": send, "disable_web_page_preview": True}, timeout=30)
+              msg = msg[len(send)+1:] if send!=part else msg[MAX:]
+          PY
