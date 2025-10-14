@@ -65,7 +65,13 @@ jobs:
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if [[ -n "$(git status --porcelain state.json)" ]]; then
+          if [ -f "state.json" ]; then
+            git add state.json
+            git commit -m "chore: save initial baseline $(date -u +'%Y-%m-%dT%H:%M:%SZ')" || echo "No diff"
+            git push origin HEAD:"${BRANCH}" || echo "Push failed"
+          else
+            echo "No state.json found."
+          fi
             git add state.json
             git commit -m "chore: update state $(date -u +'%Y-%m-%dT%H:%M:%SZ')" || true
             git fetch origin "${BRANCH}"
