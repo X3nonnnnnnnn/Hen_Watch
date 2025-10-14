@@ -1,0 +1,76 @@
+name: Hen Watch
+
+on:
+  schedule:
+    - cron: "5 */4 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Generate config.toml from VARIABLES
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ vars.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ vars.TELEGRAM_CHAT_ID }}
+          SEARCH_URL: ${{ vars.SEARCH_URL }}
+          RESULT_SELECTOR: ${{ vars.RESULT_SELECTOR }}
+          TITLE_SELECTOR: ${{ vars.TITLE_SELECTOR }}
+          LINK_SELECTOR: ${{ vars.LINK_SELECTOR }}
+        run: |
+          cat > config.toml <<'EOF'
+          search_url = '${SEARCH_URL}'
+          authors = []
+          result_selector = '${RESULT_SELECTOR}'
+          title_selector  = '${TITLE_SELECTOR}'
+          link_selector   = '${LINK_SELECTOR}'
+
+          [telegram]
+          enabled   = true
+          bot_token = '${TELEGRAM_BOT_TOKEN}'
+          chat_id   = '${TELEGRAM_CHAT_ID}'
+          EOF
+
+      - name: Run watcher (once)
+        env:
+          TELEGRAM_ENABLED: ${{ vars.TELEGRAM_ENABLED }}
+          TELEGRAM_BOT_TOKEN: ${{ vars.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ vars.TELEGRAM_CHAT_ID }}
+          SEARCH_AUTHORS: ${{ vars.SEARCH_AUTHORS }}
+          RESULT_SELECTOR: ${{ vars.RESULT_SELECTOR }}
+          TITLE_SELECTOR: ${{ vars.TITLE_SELECTOR }}
+          LINK_SELECTOR: ${{ vars.LINK_SELECTOR }}
+        run: python -m hen_watch.cli --config config.toml
+
+      - name: Commit state.json if changed
+        env:
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if [[ -n "$(git status --porcelain state.json)" ]]; then
+            git add state.json
+            git commit -m "chore: update state $(date -u +'%Y-%m-%dT%H:%M:%SZ')" || true
+            git fetch origin "${BRANCH}"
+            git rebase origin/"${BRANCH}" || git rebase --skip
+            git push origin HEAD:"${BRANCH}" || (git pull --rebase origin "${BRANCH}" && git push origin HEAD:"${BRANCH}")
+          else
+            echo "No change."
+          fi
