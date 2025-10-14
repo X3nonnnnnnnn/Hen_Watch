@@ -59,24 +59,30 @@ jobs:
           LINK_SELECTOR: ${{ vars.LINK_SELECTOR }}
         run: python -m hen_watch.cli --config config.toml
 
-      - name: Commit state.json if changed
+      - name: Commit state.json (baseline or update)
         env:
           BRANCH: ${{ github.ref_name }}
         run: |
+          set -euxo pipefail
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if [ -f "state.json" ]; then
-            git add state.json
-            git commit -m "chore: save initial baseline $(date -u +'%Y-%m-%dT%H:%M:%SZ')" || echo "No diff"
-            git push origin HEAD:"${BRANCH}" || echo "Push failed"
+
+          if [ -f state.json ]; then
+            # 即使被 .gitignore 忽略，也强制加入
+            git add -f state.json
+
+            # 如果没有 staged 变化，则不提交
+            if git diff --cached --quiet; then
+              echo "No changes to commit."
+            else
+              git commit -m "chore: update baseline $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+              # 拉取最新分支防冲突
+              git pull --rebase origin "${BRANCH}" || true
+              # 推送更新
+              git push origin HEAD:"${BRANCH}" || echo "Push failed"
+            fi
           else
-            echo "No state.json found."
+            echo "No state.json found!"
+            exit 0
           fi
-            git add state.json
-            git commit -m "chore: update state $(date -u +'%Y-%m-%dT%H:%M:%SZ')" || true
-            git fetch origin "${BRANCH}"
-            git rebase origin/"${BRANCH}" || git rebase --skip
-            git push origin HEAD:"${BRANCH}" || (git pull --rebase origin "${BRANCH}" && git push origin HEAD:"${BRANCH}")
-          else
-            echo "No change."
-          fi
+
