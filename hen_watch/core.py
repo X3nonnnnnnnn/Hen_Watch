@@ -199,60 +199,75 @@ def run_once(cfg_path: str = "config.toml") -> int:
     cfg = load_config(cfg_path)
     state = read_state()
     authors = [a for a in cfg.authors if a.strip()]
+    single_mode = not authors
 
     if "authors" not in state:
         state["authors"] = {}
 
-    first_time = False
+    # 是否是“仓库第一次跑”？——只有当 state 本身没任何作者快照时才算
+    is_initial_repo_run = (len(state["authors"]) == 0) and single_mode is False
+
     added_by_author: Dict[str, List[Dict[str, str]]] = {}
-    no_update: List[str] = []
+    new_author_baselined: List[str] = []
+    processed_existing_authors = 0
 
     if authors:
         for name in authors:
             url, items, checksum = _fetch_for_author(name, cfg)
             prev = state["authors"].get(name, {})
             prev_items_dict = {it["id"]: it for it in prev.get("items", [])}
-            added, _ = _diff(prev_items_dict, items)
 
             if not prev:
-                first_time = True
-            else:
-                if added:
-                    added_by_author[name] = added
-                else:
-                    no_update.append(name)
+                # 仅对“新作者”静默建基线，不影响其他已有作者的通知
+                new_author_baselined.append(name)
+                state["authors"][name] = {"checksum": checksum, "items": items}
+                continue
+
+            processed_existing_authors += 1
+            added, _ = _diff(prev_items_dict, items)
+            if added:
+                added_by_author[name] = added
 
             state["authors"][name] = {"checksum": checksum, "items": items}
     else:
+        # 单作者兼容逻辑维持不变：只有首次才静默
         html_url = cfg.search_url
         html = _http_get(html_url)
         checksum = _checksum(html)
         items = _extract_items(html, cfg)
         prev = state.get("single", {})
         prev_items_dict = {it["id"]: it for it in prev.get("items", [])}
-        added, _ = _diff(prev_items_dict, items)
         if not prev:
-            first_time = True
-        elif added:
-            added_by_author[html_url] = added
+            state["single"] = {"checksum": checksum, "items": items}
+            write_state(state)
+            print("First run (single URL): baseline saved. No notification.")
+            return 0
         else:
-            no_update.append(html_url)
-        state["single"] = {"checksum": checksum, "items": items}
+            added, _ = _diff(prev_items_dict, items)
+            if added:
+                added_by_author[html_url] = added
+            state["single"] = {"checksum": checksum, "items": items}
 
-    if first_time:
-        write_state(state)
-        print("First run: baseline saved. No notification.")
-        return 0
+    # ——到这里，所有作者的 state 都已更新——
+    # 判定是否需要发送通知：
+    # 1) 仓库真正第一次跑：不通知（避免历史 spam）
+    # 2) 只新增了“新作者”，但没有任何“既有作者更新”：仍然可以选择不通知，或提示一句
+    #    我们按你的需求：既有作者都无更新 → 发 “全都没更新”
+    if single_mode is False:
+        if is_initial_repo_run and processed_existing_authors == 0:
+            write_state(state)
+            print("First run (repo): baseline saved for all authors. No notification.")
+            return 0
 
-    # 汇总文本
+    # 有新增则发新增；否则发 “全都没更新”
     if cfg.telegram_enabled:
         if added_by_author:
             summary_lines = ["🕒 本次巡检结果（仅展示新增）："]
             for a, items in added_by_author.items():
-                summary_lines.append(f"【{a}】 新增 {len(items)} 条  {_author_url(a)}")
+                summary_lines.append(f" 新增 {len(items)} 条  {_author_url(a)}")
             summary = "\n".join(summary_lines)
 
-            # 分段保护（4096）
+            # 长度保护 & 发送
             msg = summary
             while msg:
                 chunk = msg[:4000]
@@ -263,25 +278,20 @@ def run_once(cfg_path: str = "config.toml") -> int:
                     to_send, msg = chunk, msg[4000:]
                 _send_text(cfg.telegram_bot_token, cfg.telegram_chat_id, to_send)
 
-            # 每个作者发送图片组
+            # 每个作者的封面组
             for name, items in added_by_author.items():
                 medias = []
                 for it in items:
                     if it.get("cover"):
-                        medias.append({
-                            "type": "photo",
-                            "media": it["cover"],
-                            "caption": it["title"][:100]
-                        })
+                        medias.append({"type": "photo", "media": it["cover"], "caption": it["title"][:100]})
                     if len(medias) == 10:
                         _send_media_group(cfg.telegram_bot_token, cfg.telegram_chat_id, medias)
                         medias = []
                 if medias:
                     _send_media_group(cfg.telegram_bot_token, cfg.telegram_chat_id, medias)
         else:
-            # 所有作者都无更新时，发送“全都没更新”
             _send_text(cfg.telegram_bot_token, cfg.telegram_chat_id, "全都没更新")
-
 
     write_state(state)
     return 0
+
