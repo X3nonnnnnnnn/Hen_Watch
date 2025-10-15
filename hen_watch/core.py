@@ -275,7 +275,7 @@ def run_once(cfg_path: str = "config.toml") -> int:
             # 单条汇总消息（包含作者名）；超长再分段
             lines = ["🕒 本次巡检结果（仅展示新增）："]
             for a, items in added_by_author.items():
-                lines.append(f" 新增 {len(items)} 条  {_author_url(a)}")
+                lines.append(f"【{a}】 新增 {len(items)} 条  {_author_url(a)}")
             summary = "\n".join(lines)
 
             if len(summary) <= 4000:
