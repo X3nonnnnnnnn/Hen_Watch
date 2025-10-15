@@ -244,38 +244,44 @@ def run_once(cfg_path: str = "config.toml") -> int:
         print("First run: baseline saved. No notification.")
         return 0
 
+    # 汇总文本
     if cfg.telegram_enabled:
-        summary_lines = ["🕒 本次巡检结果（仅展示新增）："]
-        if authors:
-            for a in authors:
-                if a in added_by_author:
-                    summary_lines.append(f"【{a}】 新增 {len(added_by_author[a])} 条  {_author_url(a)}")
+        if added_by_author:
+            summary_lines = ["🕒 本次巡检结果（仅展示新增）："]
+            for a, items in added_by_author.items():
+                summary_lines.append(f"【{a}】 新增 {len(items)} 条  {_author_url(a)}")
+            summary = "\n".join(summary_lines)
+
+            # 分段保护（4096）
+            msg = summary
+            while msg:
+                chunk = msg[:4000]
+                cut = chunk.rfind("\n")
+                if 0 < cut < 4000:
+                    to_send, msg = chunk[:cut], msg[cut+1:]
                 else:
-                    summary_lines.append(f"【{a}】 无更新  {_author_url(a)}")
-        else:
-            summary_lines.append("【单作者】 " + ("有更新" if added_by_author else "无更新"))
-        summary = "\n".join(summary_lines)
+                    to_send, msg = chunk, msg[4000:]
+                _send_text(cfg.telegram_bot_token, cfg.telegram_chat_id, to_send)
 
-        msg = summary
-        while msg:
-            chunk = msg[:4000]
-            cut = chunk.rfind("\n")
-            if 0 < cut < 4000:
-                to_send, msg = chunk[:cut], msg[cut+1:]
-            else:
-                to_send, msg = chunk, msg[4000:]
-            _send_text(cfg.telegram_bot_token, cfg.telegram_chat_id, to_send)
-
-        for name, items in added_by_author.items():
-            medias = []
-            for it in items:
-                if it.get("cover"):
-                    medias.append({"type": "photo", "media": it["cover"], "caption": it["title"][:100]})
-                if len(medias) == 10:
+            # 每个作者发送图片组
+            for name, items in added_by_author.items():
+                medias = []
+                for it in items:
+                    if it.get("cover"):
+                        medias.append({
+                            "type": "photo",
+                            "media": it["cover"],
+                            "caption": it["title"][:100]
+                        })
+                    if len(medias) == 10:
+                        _send_media_group(cfg.telegram_bot_token, cfg.telegram_chat_id, medias)
+                        medias = []
+                if medias:
                     _send_media_group(cfg.telegram_bot_token, cfg.telegram_chat_id, medias)
-                    medias = []
-            if medias:
-                _send_media_group(cfg.telegram_bot_token, cfg.telegram_chat_id, medias)
+        else:
+            # 所有作者都无更新时，发送“全都没更新”
+            _send_text(cfg.telegram_bot_token, cfg.telegram_chat_id, "全都没更新")
+
 
     write_state(state)
     return 0
