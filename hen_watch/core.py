@@ -51,6 +51,7 @@ def load_config(cfg_path: str = "config.toml") -> Config:
         telegram_chat_id=str(tg.get("chat_id", "") or ""),
     )
 
+    # 环境变量覆盖
     authors_env = _pick_env("SEARCH_AUTHORS")
     if authors_env:
         parts = re.split(r"[,，、\n\r]+", authors_env)
@@ -112,6 +113,7 @@ def _checksum(html: str) -> str:
     return hashlib.sha256(_text(soup.get_text(" ")).encode("utf-8")).hexdigest()
 
 def _cover_from_anchor(a) -> str:
+    # 现阶段不再发图片，但保留抽取逻辑（以便将来需要）
     img = a.find("img")
     if not img:
         return ""
@@ -140,6 +142,7 @@ def _extract_items(html: str, cfg: Config) -> List[Dict[str, str]]:
             anchor = node.select_one("a[href*='/g/']")
         if not anchor or not anchor.has_attr("href") or "/g/" not in anchor["href"]:
             continue
+
         title = ""
         if cfg.title_selector.strip():
             tnode = node.select_one(cfg.title_selector)
@@ -147,6 +150,7 @@ def _extract_items(html: str, cfg: Config) -> List[Dict[str, str]]:
                 title = _text(tnode.get_text(" "))
         if not title:
             title = _text(anchor.get_text(" "))
+
         url = ""
         if cfg.link_selector.strip():
             lnode = node.select_one(cfg.link_selector)
@@ -156,9 +160,16 @@ def _extract_items(html: str, cfg: Config) -> List[Dict[str, str]]:
             url = anchor["href"]
         if url.startswith("/"):
             url = "https://e-hentai.org" + url
+
         ident_src = url or title
         ident = hashlib.sha1(ident_src.encode("utf-8")).hexdigest()[:16]
-        items.append({"id": ident, "title": title or "(no title)", "url": url, "cover": _cover_from_anchor(anchor)})
+        items.append({
+            "id": ident,
+            "title": title or "(no title)",
+            "url": url,
+            "cover": _cover_from_anchor(anchor)
+        })
+
     uniq, seen = [], set()
     for it in items:
         if it["id"] not in seen:
@@ -187,13 +198,13 @@ def _send_text(token: str, chat: str, text: str) -> None:
     if not token or not chat:
         return
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    requests.post(url, json={"chat_id": chat, "text": text, "disable_web_page_preview": True}, timeout=30)
-
-def _send_media_group(token: str, chat: str, medias: List[Dict[str, str]]) -> None:
-    if not token or not chat or not medias:
-        return
-    url = f"https://api.telegram.org/bot{token}/sendMediaGroup"
-    requests.post(url, json={"chat_id": chat, "media": medias}, timeout=45)
+    # 单条消息发送；失败时打印错误便于排查
+    r = requests.post(url, json={"chat_id": chat, "text": text, "disable_web_page_preview": True}, timeout=30)
+    if r.status_code != 200:
+        try:
+            print("TELEGRAM_SEND_ERROR:", r.status_code, r.text[:300])
+        except Exception:
+            pass
 
 def run_once(cfg_path: str = "config.toml") -> int:
     cfg = load_config(cfg_path)
@@ -251,8 +262,7 @@ def run_once(cfg_path: str = "config.toml") -> int:
     # ——到这里，所有作者的 state 都已更新——
     # 判定是否需要发送通知：
     # 1) 仓库真正第一次跑：不通知（避免历史 spam）
-    # 2) 只新增了“新作者”，但没有任何“既有作者更新”：仍然可以选择不通知，或提示一句
-    #    我们按你的需求：既有作者都无更新 → 发 “全都没更新”
+    # 2) 只新增了“新作者”，但没有任何“既有作者更新”：按你的需求，仍会发送“全都没更新”
     if single_mode is False:
         if is_initial_repo_run and processed_existing_authors == 0:
             write_state(state)
@@ -262,36 +272,26 @@ def run_once(cfg_path: str = "config.toml") -> int:
     # 有新增则发新增；否则发 “全都没更新”
     if cfg.telegram_enabled:
         if added_by_author:
-            summary_lines = ["🕒 本次巡检结果（仅展示新增）："]
+            # 单条汇总消息（包含作者名）；超长再分段
+            lines = ["🕒 本次巡检结果（仅展示新增）："]
             for a, items in added_by_author.items():
-                summary_lines.append(f" 新增 {len(items)} 条  {_author_url(a)}")
-            summary = "\n".join(summary_lines)
+                lines.append(f" 新增 {len(items)} 条  {_author_url(a)}")
+            summary = "\n".join(lines)
 
-            # 长度保护 & 发送
-            msg = summary
-            while msg:
-                chunk = msg[:4000]
-                cut = chunk.rfind("\n")
-                if 0 < cut < 4000:
-                    to_send, msg = chunk[:cut], msg[cut+1:]
-                else:
-                    to_send, msg = chunk, msg[4000:]
-                _send_text(cfg.telegram_bot_token, cfg.telegram_chat_id, to_send)
-
-            # 每个作者的封面组
-            for name, items in added_by_author.items():
-                medias = []
-                for it in items:
-                    if it.get("cover"):
-                        medias.append({"type": "photo", "media": it["cover"], "caption": it["title"][:100]})
-                    if len(medias) == 10:
-                        _send_media_group(cfg.telegram_bot_token, cfg.telegram_chat_id, medias)
-                        medias = []
-                if medias:
-                    _send_media_group(cfg.telegram_bot_token, cfg.telegram_chat_id, medias)
+            if len(summary) <= 4000:
+                _send_text(cfg.telegram_bot_token, cfg.telegram_chat_id, summary)
+            else:
+                msg = summary
+                while msg:
+                    chunk = msg[:4000]
+                    cut = chunk.rfind("\n")
+                    if 0 < cut < 4000:
+                        to_send, msg = chunk[:cut], msg[cut+1:]
+                    else:
+                        to_send, msg = chunk, msg[4000:]
+                    _send_text(cfg.telegram_bot_token, cfg.telegram_chat_id, to_send)
         else:
             _send_text(cfg.telegram_bot_token, cfg.telegram_chat_id, "全都没更新")
 
     write_state(state)
     return 0
-
