@@ -3,8 +3,9 @@ import hashlib
 import os
 import re
 from dataclasses import dataclass
-from typing import List, Dict, Tuple, Optional
-from urllib.parse import quote
+from typing import List, Dict, Optional
+from urllib.parse import quote, urljoin
+import html as html_lib
 
 import requests
 from bs4 import BeautifulSoup
@@ -120,42 +121,84 @@ def _checksum(html: str) -> str:
     return hashlib.sha256(_text(soup.get_text(" ")).encode("utf-8")).hexdigest()
 
 
-# ====== 新增：提取封面 / 动图 / 视频 ======
-def _extract_image_or_video_url(html: str) -> Optional[str]:
-    """从画廊页面提取封面、动图或视频链接"""
-    # 1) 视频
-    m = re.search(r'<video[^>]+src=["\']([^"\']+\.(?:mp4|webm))["\']', html, re.I)
-    if m:
-        return m.group(1)
-    # 2) 原图按钮
-    m = re.search(
-        r'<div id=["\']i3["\'][^>]*>\s*<a[^>]+href=["\']([^"\']+\.(?:gif|jpg|jpeg|png|webp))["\']',
-        html,
-        re.I,
-    )
-    if m:
-        return m.group(1)
-    # 3) 常规 <img id="img">
-    m = re.search(r'<img[^>]*id=["\']img["\'][^>]*src=["\']([^"\']+)["\']', html, re.I)
-    if m:
-        return m.group(1)
-    return None
+# ===== 基于你给的思路：从结果卡片上“可靠提取缩略图” =====
 
-
-def _cover_from_anchor(a) -> str:
-    img = a.find("img")
-    if not img:
-        return ""
-    src = (img.get("src") or "").strip()
+def _abs_url(base: str, src: str) -> str:
+    """把 // 或 / 或相对路径补成绝对 URL"""
     if not src:
         return ""
-    if src.startswith("//"):
-        src = "https:" + src
-    if src.startswith("/"):
-        src = "https://e-hentai.org" + src
-    if not (src.startswith("http://") or src.startswith("https://")):
-        return ""
-    return src
+    s = html_lib.unescape(src.strip())
+    if s.startswith("//"):
+        return "https:" + s
+    return urljoin(base, s)
+
+def _pick_from_img_tag(img) -> Optional[str]:
+    """按优先级从 <img> 提取真实地址：data-* → srcset(最大) → src → noscript 内的真实 <img>"""
+    # 1) 常见懒加载属性
+    for key in ("data-src", "data-lazy", "data-original"):
+        v = img.get(key)
+        if v:
+            return v
+    # 2) srcset（取最后一项通常分辨率最高）
+    ss = img.get("srcset")
+    if ss:
+        parts = [p.strip().split(" ")[0] for p in ss.split(",") if p.strip()]
+        if parts:
+            return parts[-1] or parts[0]
+    # 3) 常规 src（排除 data: 占位）
+    s = img.get("src")
+    if s and not s.startswith("data:"):
+        return s
+    # 4) 就近的 <noscript> 里再找一次真实 <img>
+    ns = None
+    cur = img
+    for _ in range(3):
+        if not cur:
+            break
+        ns = cur.find_next_sibling("noscript") or cur.find("noscript")
+        if ns:
+            break
+        cur = cur.parent
+    if ns and ns.string:
+        ns_soup = BeautifulSoup(ns.string, "html.parser")
+        real_img = ns_soup.find("img")
+        if real_img:
+            return real_img.get("data-src") or real_img.get("src")
+    return None
+
+def _pick_from_style(el) -> Optional[str]:
+    """从 style='background-image:url(...)' 中提取 URL"""
+    style = el.get("style") or ""
+    m = re.search(r"url\((['\"]?)(.*?)\1\)", style, flags=re.I)
+    return m.group(2) if m else None
+
+def _cover_from_result_node(node, page_base: str) -> str:
+    """
+    从搜索结果的“卡片节点”上尽可能取到缩略图：
+    - 先找 img：data-src/srcset/src → noscript
+    - 再找 div 背景图 style → noscript
+    """
+    # 优先卡片内部的所有 img
+    for img in node.select("img"):
+        u = _pick_from_img_tag(img)
+        if u and not u.startswith("data:"):
+            return _abs_url(page_base, u)
+
+    # 其次：div 背景图 或 noscript 内嵌
+    for el in node.select("div"):
+        u = _pick_from_style(el)
+        if u:
+            return _abs_url(page_base, u)
+        ns = el.find("noscript")
+        if ns and ns.string:
+            ns_soup = BeautifulSoup(ns.string, "html.parser")
+            real_img = ns_soup.find("img")
+            if real_img:
+                u2 = real_img.get("data-src") or real_img.get("src")
+                if u2:
+                    return _abs_url(page_base, u2)
+
+    return ""
 
 
 def _extract_items(html: str, cfg: Config) -> List[Dict[str, str]]:
@@ -163,9 +206,10 @@ def _extract_items(html: str, cfg: Config) -> List[Dict[str, str]]:
     if not cfg.result_selector:
         return [{"id": "PAGE", "title": "Full page", "url": "", "cover": ""}]
 
+    page_base = "https://e-hentai.org"
     items: List[Dict[str, str]] = []
     for node in soup.select(cfg.result_selector):
-        anchor = None
+        # 找到卡片上的画廊链接
         if getattr(node, "name", None) == "a" and node.has_attr("href"):
             anchor = node
         else:
@@ -173,6 +217,7 @@ def _extract_items(html: str, cfg: Config) -> List[Dict[str, str]]:
         if not anchor or not anchor.has_attr("href") or "/g/" not in anchor["href"]:
             continue
 
+        # 标题
         title = ""
         if cfg.title_selector.strip():
             tnode = node.select_one(cfg.title_selector)
@@ -181,6 +226,7 @@ def _extract_items(html: str, cfg: Config) -> List[Dict[str, str]]:
         if not title:
             title = _text(anchor.get_text(" "))
 
+        # URL（补全成绝对）
         url = ""
         if cfg.link_selector.strip():
             lnode = node.select_one(cfg.link_selector)
@@ -188,20 +234,12 @@ def _extract_items(html: str, cfg: Config) -> List[Dict[str, str]]:
                 url = lnode["href"]
         if not url:
             url = anchor["href"]
-        if url.startswith("/"):
-            url = "https://e-hentai.org" + url
+        url = _abs_url(page_base, url)
 
-        cover = _cover_from_anchor(anchor)
-        # ====== 新增逻辑：若没封面则抓画廊页面 ======
-        if not cover and url.startswith("https://e-hentai.org/g/"):
-            try:
-                ghtml = _http_get(url)
-                media = _extract_image_or_video_url(ghtml)
-                if media:
-                    cover = media
-            except Exception:
-                pass
+        # 封面（使用新的“结果卡片提取策略”）
+        cover = _cover_from_result_node(node, page_base)
 
+        # 生成条目
         ident_src = url or title
         ident = hashlib.sha1(ident_src.encode("utf-8")).hexdigest()[:16]
         items.append({
@@ -211,6 +249,7 @@ def _extract_items(html: str, cfg: Config) -> List[Dict[str, str]]:
             "cover": cover,
         })
 
+    # 去重
     uniq, seen = [], set()
     for it in items:
         if it["id"] not in seen:
@@ -260,6 +299,7 @@ def run_once(cfg_path: str = "config.toml") -> int:
     if "authors" not in state:
         state["authors"] = {}
 
+    # 是否首次（仓库级）
     is_initial_repo_run = (len(state["authors"]) == 0) and single_mode is False
     added_by_author: Dict[str, List[Dict[str, str]]] = {}
     new_author_baselined: List[str] = []
@@ -272,6 +312,7 @@ def run_once(cfg_path: str = "config.toml") -> int:
             prev_items_dict = {it["id"]: it for it in prev.get("items", [])}
 
             if not prev:
+                # 新作者静默建基线
                 new_author_baselined.append(name)
                 state["authors"][name] = {"checksum": checksum, "items": items}
                 continue
@@ -283,6 +324,7 @@ def run_once(cfg_path: str = "config.toml") -> int:
 
             state["authors"][name] = {"checksum": checksum, "items": items}
     else:
+        # 单 URL 模式
         html_url = cfg.search_url
         html = _http_get(html_url)
         checksum = _checksum(html)
@@ -300,16 +342,19 @@ def run_once(cfg_path: str = "config.toml") -> int:
                 added_by_author[html_url] = added
             state["single"] = {"checksum": checksum, "items": items}
 
+    # 首次仓库建基线：不通知
     if single_mode is False:
         if is_initial_repo_run and processed_existing_authors == 0:
             write_state(state)
             print("First run (repo): baseline saved for all authors. No notification.")
             return 0
 
+    # 有新增则发新增；否则发 “全都没更新”
     if cfg.telegram_enabled:
         if added_by_author:
             lines = ["🕒 本次巡检结果（仅展示新增）："]
             for a, items in added_by_author.items():
+                # 直接发裸链接，避免 Telegram 二次确认弹窗
                 lines.append(f"{a}: 新增 {len(items)} 条 {_author_url(a)}")
             summary = "\n".join(lines)
 
