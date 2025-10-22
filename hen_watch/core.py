@@ -121,10 +121,10 @@ def _checksum(html: str) -> str:
     return hashlib.sha256(_text(soup.get_text(" ")).encode("utf-8")).hexdigest()
 
 
-# ===== 基于你给的思路：从结果卡片上“可靠提取缩略图” =====
+# ---------- 缩略图提取：完全基于“搜索结果页卡片”，不再打开画廊页 ----------
 
 def _abs_url(base: str, src: str) -> str:
-    """把 // 或 / 或相对路径补成绝对 URL"""
+    """把 //、/ 或相对路径补成绝对 URL，并做 HTML 反转义"""
     if not src:
         return ""
     s = html_lib.unescape(src.strip())
@@ -133,7 +133,7 @@ def _abs_url(base: str, src: str) -> str:
     return urljoin(base, s)
 
 def _pick_from_img_tag(img) -> Optional[str]:
-    """按优先级从 <img> 提取真实地址：data-* → srcset(最大) → src → noscript 内的真实 <img>"""
+    """按优先级从 <img> 提取真实地址：data-* → srcset(最大) → src → noscript 内真实 <img>"""
     # 1) 常见懒加载属性
     for key in ("data-src", "data-lazy", "data-original"):
         v = img.get(key)
@@ -172,31 +172,38 @@ def _pick_from_style(el) -> Optional[str]:
     m = re.search(r"url\((['\"]?)(.*?)\1\)", style, flags=re.I)
     return m.group(2) if m else None
 
-def _cover_from_result_node(node, page_base: str) -> str:
+def _cover_from_result_context(node, anchor, page_base: str) -> str:
     """
-    从搜索结果的“卡片节点”上尽可能取到缩略图：
-    - 先找 img：data-src/srcset/src → noscript
-    - 再找 div 背景图 style → noscript
+    从结果“上下文”尽可能取到缩略图：
+    - 在 node / anchor / node.parent / node.parent.parent 这 4 层内找：
+      img（data-*/srcset/src/noscript） 或 div 的 background-image 或 div 内 noscript
     """
-    # 优先卡片内部的所有 img
-    for img in node.select("img"):
-        u = _pick_from_img_tag(img)
-        if u and not u.startswith("data:"):
-            return _abs_url(page_base, u)
+    candidates = []
+    for x in (node, anchor, getattr(node, "parent", None), getattr(getattr(node, "parent", None), "parent", None)):
+        if x and x not in candidates:
+            candidates.append(x)
 
-    # 其次：div 背景图 或 noscript 内嵌
-    for el in node.select("div"):
-        u = _pick_from_style(el)
-        if u:
-            return _abs_url(page_base, u)
-        ns = el.find("noscript")
-        if ns and ns.string:
-            ns_soup = BeautifulSoup(ns.string, "html.parser")
-            real_img = ns_soup.find("img")
-            if real_img:
-                u2 = real_img.get("data-src") or real_img.get("src")
-                if u2:
-                    return _abs_url(page_base, u2)
+    # 先找 <img>
+    for ctx in candidates:
+        for img in ctx.select("img"):
+            u = _pick_from_img_tag(img)
+            if u and not u.startswith("data:"):
+                return _abs_url(page_base, u)
+
+    # 再找 div 背景图 / noscript
+    for ctx in candidates:
+        for el in ctx.select("div"):
+            u = _pick_from_style(el)
+            if u:
+                return _abs_url(page_base, u)
+            ns = el.find("noscript")
+            if ns and ns.string:
+                ns_soup = BeautifulSoup(ns.string, "html.parser")
+                real_img = ns_soup.find("img")
+                if real_img:
+                    u2 = real_img.get("data-src") or real_img.get("src")
+                    if u2:
+                        return _abs_url(page_base, u2)
 
     return ""
 
@@ -226,7 +233,7 @@ def _extract_items(html: str, cfg: Config) -> List[Dict[str, str]]:
         if not title:
             title = _text(anchor.get_text(" "))
 
-        # URL（补全成绝对）
+        # 画廊 URL（绝对化）
         url = ""
         if cfg.link_selector.strip():
             lnode = node.select_one(cfg.link_selector)
@@ -236,8 +243,8 @@ def _extract_items(html: str, cfg: Config) -> List[Dict[str, str]]:
             url = anchor["href"]
         url = _abs_url(page_base, url)
 
-        # 封面（使用新的“结果卡片提取策略”）
-        cover = _cover_from_result_node(node, page_base)
+        # 封面（只在搜索页上下文内解析，不再打开画廊页）
+        cover = _cover_from_result_context(node, anchor, page_base)
 
         # 生成条目
         ident_src = url or title
@@ -299,7 +306,7 @@ def run_once(cfg_path: str = "config.toml") -> int:
     if "authors" not in state:
         state["authors"] = {}
 
-    # 是否首次（仓库级）
+    # 是否仓库首次
     is_initial_repo_run = (len(state["authors"]) == 0) and single_mode is False
     added_by_author: Dict[str, List[Dict[str, str]]] = {}
     new_author_baselined: List[str] = []
@@ -312,7 +319,6 @@ def run_once(cfg_path: str = "config.toml") -> int:
             prev_items_dict = {it["id"]: it for it in prev.get("items", [])}
 
             if not prev:
-                # 新作者静默建基线
                 new_author_baselined.append(name)
                 state["authors"][name] = {"checksum": checksum, "items": items}
                 continue
@@ -354,7 +360,7 @@ def run_once(cfg_path: str = "config.toml") -> int:
         if added_by_author:
             lines = ["🕒 本次巡检结果（仅展示新增）："]
             for a, items in added_by_author.items():
-                # 直接发裸链接，避免 Telegram 二次确认弹窗
+                # 直接裸链接，避免 Telegram 二次确认弹窗
                 lines.append(f"{a}: 新增 {len(items)} 条 {_author_url(a)}")
             summary = "\n".join(lines)
 
