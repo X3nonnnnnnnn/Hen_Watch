@@ -13,6 +13,7 @@ from .storage import read_state, write_state
 
 EH_BASE = "https://e-hentai.org/?f_search="
 
+
 @dataclass
 class Config:
     search_url: str
@@ -24,9 +25,11 @@ class Config:
     telegram_bot_token: str
     telegram_chat_id: str
 
+
 def _pick_env(name: str, default: Optional[str] = None) -> Optional[str]:
     v = os.getenv(name)
     return v if v is not None else default
+
 
 def load_config(cfg_path: str = "config.toml") -> Config:
     try:
@@ -87,6 +90,7 @@ def load_config(cfg_path: str = "config.toml") -> Config:
 
     return cfg
 
+
 DEFAULT_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -98,13 +102,16 @@ DEFAULT_HEADERS = {
     "Cache-Control": "no-cache",
 }
 
+
 def _http_get(url: str, timeout: int = 30) -> str:
     r = requests.get(url, headers=DEFAULT_HEADERS, timeout=timeout)
     r.raise_for_status()
     return r.text
 
+
 def _text(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
+
 
 def _checksum(html: str) -> str:
     soup = BeautifulSoup(html, "html.parser")
@@ -112,8 +119,30 @@ def _checksum(html: str) -> str:
         t.extract()
     return hashlib.sha256(_text(soup.get_text(" ")).encode("utf-8")).hexdigest()
 
+
+# ====== 新增：提取封面 / 动图 / 视频 ======
+def _extract_image_or_video_url(html: str) -> Optional[str]:
+    """从画廊页面提取封面、动图或视频链接"""
+    # 1) 视频
+    m = re.search(r'<video[^>]+src=["\']([^"\']+\.(?:mp4|webm))["\']', html, re.I)
+    if m:
+        return m.group(1)
+    # 2) 原图按钮
+    m = re.search(
+        r'<div id=["\']i3["\'][^>]*>\s*<a[^>]+href=["\']([^"\']+\.(?:gif|jpg|jpeg|png|webp))["\']',
+        html,
+        re.I,
+    )
+    if m:
+        return m.group(1)
+    # 3) 常规 <img id="img">
+    m = re.search(r'<img[^>]*id=["\']img["\'][^>]*src=["\']([^"\']+)["\']', html, re.I)
+    if m:
+        return m.group(1)
+    return None
+
+
 def _cover_from_anchor(a) -> str:
-    # 现阶段不再发图片，但保留抽取逻辑（以便将来需要）
     img = a.find("img")
     if not img:
         return ""
@@ -127,6 +156,7 @@ def _cover_from_anchor(a) -> str:
     if not (src.startswith("http://") or src.startswith("https://")):
         return ""
     return src
+
 
 def _extract_items(html: str, cfg: Config) -> List[Dict[str, str]]:
     soup = BeautifulSoup(html, "html.parser")
@@ -161,13 +191,24 @@ def _extract_items(html: str, cfg: Config) -> List[Dict[str, str]]:
         if url.startswith("/"):
             url = "https://e-hentai.org" + url
 
+        cover = _cover_from_anchor(anchor)
+        # ====== 新增逻辑：若没封面则抓画廊页面 ======
+        if not cover and url.startswith("https://e-hentai.org/g/"):
+            try:
+                ghtml = _http_get(url)
+                media = _extract_image_or_video_url(ghtml)
+                if media:
+                    cover = media
+            except Exception:
+                pass
+
         ident_src = url or title
         ident = hashlib.sha1(ident_src.encode("utf-8")).hexdigest()[:16]
         items.append({
             "id": ident,
             "title": title or "(no title)",
             "url": url,
-            "cover": _cover_from_anchor(anchor)
+            "cover": cover,
         })
 
     uniq, seen = [], set()
@@ -177,13 +218,16 @@ def _extract_items(html: str, cfg: Config) -> List[Dict[str, str]]:
             uniq.append(it)
     return uniq
 
+
 def _author_url(name: str) -> str:
     return f"{EH_BASE}{quote(name.strip())}"
+
 
 def _fetch_for_author(author: str, cfg: Config):
     url = _author_url(author)
     html = _http_get(url)
     return url, _extract_items(html, cfg), _checksum(html)
+
 
 def _diff(prev_items: Dict[str, Dict[str, str]], new_items: List[Dict[str, str]]):
     old_ids = set(prev_items.keys())
@@ -194,17 +238,18 @@ def _diff(prev_items: Dict[str, Dict[str, str]], new_items: List[Dict[str, str]]
     removed = [prev_items[i] for i in removed_ids]
     return added, removed
 
+
 def _send_text(token: str, chat: str, text: str) -> None:
     if not token or not chat:
         return
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    # 单条消息发送；失败时打印错误便于排查
     r = requests.post(url, json={"chat_id": chat, "text": text, "disable_web_page_preview": True}, timeout=30)
     if r.status_code != 200:
         try:
             print("TELEGRAM_SEND_ERROR:", r.status_code, r.text[:300])
         except Exception:
             pass
+
 
 def run_once(cfg_path: str = "config.toml") -> int:
     cfg = load_config(cfg_path)
@@ -215,9 +260,7 @@ def run_once(cfg_path: str = "config.toml") -> int:
     if "authors" not in state:
         state["authors"] = {}
 
-    # 是否是“仓库第一次跑”？——只有当 state 本身没任何作者快照时才算
     is_initial_repo_run = (len(state["authors"]) == 0) and single_mode is False
-
     added_by_author: Dict[str, List[Dict[str, str]]] = {}
     new_author_baselined: List[str] = []
     processed_existing_authors = 0
@@ -229,7 +272,6 @@ def run_once(cfg_path: str = "config.toml") -> int:
             prev_items_dict = {it["id"]: it for it in prev.get("items", [])}
 
             if not prev:
-                # 仅对“新作者”静默建基线，不影响其他已有作者的通知
                 new_author_baselined.append(name)
                 state["authors"][name] = {"checksum": checksum, "items": items}
                 continue
@@ -241,7 +283,6 @@ def run_once(cfg_path: str = "config.toml") -> int:
 
             state["authors"][name] = {"checksum": checksum, "items": items}
     else:
-        # 单作者兼容逻辑维持不变：只有首次才静默
         html_url = cfg.search_url
         html = _http_get(html_url)
         checksum = _checksum(html)
@@ -259,23 +300,17 @@ def run_once(cfg_path: str = "config.toml") -> int:
                 added_by_author[html_url] = added
             state["single"] = {"checksum": checksum, "items": items}
 
-    # ——到这里，所有作者的 state 都已更新——
-    # 判定是否需要发送通知：
-    # 1) 仓库真正第一次跑：不通知（避免历史 spam）
-    # 2) 只新增了“新作者”，但没有任何“既有作者更新”：按你的需求，仍会发送“全都没更新”
     if single_mode is False:
         if is_initial_repo_run and processed_existing_authors == 0:
             write_state(state)
             print("First run (repo): baseline saved for all authors. No notification.")
             return 0
 
-    # 有新增则发新增；否则发 “全都没更新”
     if cfg.telegram_enabled:
         if added_by_author:
-            # 单条汇总消息（包含作者名）；超长再分段
             lines = ["🕒 本次巡检结果（仅展示新增）："]
             for a, items in added_by_author.items():
-                lines.append(f"【{a}】 新增 {len(items)} 条  {_author_url(a)}")
+                lines.append(f"{a}: 新增 {len(items)} 条 {_author_url(a)}")
             summary = "\n".join(lines)
 
             if len(summary) <= 4000:
