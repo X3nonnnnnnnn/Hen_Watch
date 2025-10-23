@@ -327,6 +327,76 @@ def _send_photo(token: str, chat: str, photo: str, caption: str = "") -> bool:
     return True
 
 
+def _send_media_group(token: str, chat: str, media: List[Dict[str, str]]) -> bool:
+    if not token or not chat or not media:
+        return False
+    url = f"https://api.telegram.org/bot{token}/sendMediaGroup"
+    payload = {"chat_id": chat, "media": media}
+    try:
+        r = requests.post(url, json=payload, timeout=30)
+    except Exception as exc:  # pragma: no cover - 网络异常只记录
+        print("TELEGRAM_SEND_MEDIA_GROUP_EXCEPTION:", exc)
+        return False
+    if r.status_code != 200:
+        try:
+            print("TELEGRAM_SEND_MEDIA_GROUP_ERROR:", r.status_code, r.text[:300])
+        except Exception:
+            pass
+        return False
+    return True
+
+
+def _chunked(seq: List[Dict[str, str]], size: int) -> List[List[Dict[str, str]]]:
+    return [seq[i : i + size] for i in range(0, len(seq), size)]
+
+
+def _notify_author_updates(token: str, chat: str, author: str, items: List[Dict[str, str]]) -> None:
+    if not token or not chat or not items:
+        return
+
+    total = len(items)
+    search_link = _author_url(author)
+    cover_items = [it for it in items if it.get("cover")]
+
+    if cover_items:
+        groups = _chunked(cover_items, 10)
+        for idx, group in enumerate(groups):
+            media: List[Dict[str, str]] = []
+            for pos, it in enumerate(group):
+                lines = []
+                if idx == 0 and pos == 0:
+                    lines.append(f"📚 {author} 新增 {total} 条：")
+                    if search_link:
+                        lines.append(search_link)
+                lines.append(it["title"])
+                lines.append(it["url"])
+                caption = "\n".join(filter(None, lines))[:1024]
+                media.append({
+                    "type": "photo",
+                    "media": it["cover"],
+                    "caption": caption,
+                })
+            if not _send_media_group(token, chat, media):
+                break
+        else:
+            # 所有带封面的都发送成功，再发送无封面的文本条目
+            text_only = [it for it in items if not it.get("cover")]
+            if text_only:
+                header = f"📚 {author} 新增 {total} 条：\n{search_link}"
+                _send_text(token, chat, header)
+                for it in text_only:
+                    _send_text(token, chat, f"{it['title']}\n{it['url']}")
+            return
+
+    # 回退逻辑：逐条发送
+    header = f"📚 {author} 新增 {total} 条：\n{search_link}"
+    _send_text(token, chat, header)
+    for it in items:
+        caption = f"{it['title']}\n{it['url']}"
+        if not _send_photo(token, chat, it.get("cover", ""), caption):
+            _send_text(token, chat, caption)
+
+
 def run_once(cfg_path: str = "config.toml") -> int:
     cfg = load_config(cfg_path)
     state = read_state()
@@ -392,37 +462,13 @@ def run_once(cfg_path: str = "config.toml") -> int:
     # 有新增则发新增；否则发 “全都没更新”
     if cfg.telegram_enabled:
         if added_by_author:
-            lines = ["🕒 本次巡检结果（仅展示新增）："]
             for a, items in added_by_author.items():
-                # 直接裸链接，避免 Telegram 二次确认弹窗
-                lines.append(f"{a}: 新增 {len(items)} 条 {_author_url(a)}")
-            summary = "\n".join(lines)
-
-            if len(summary) <= 4000:
-                _send_text(cfg.telegram_bot_token, cfg.telegram_chat_id, summary)
-            else:
-                msg = summary
-                while msg:
-                    chunk = msg[:4000]
-                    cut = chunk.rfind("\n")
-                    if 0 < cut < 4000:
-                        to_send, msg = chunk[:cut], msg[cut+1:]
-                    else:
-                        to_send, msg = chunk, msg[4000:]
-                    _send_text(cfg.telegram_bot_token, cfg.telegram_chat_id, to_send)
-
-            for a, items in added_by_author.items():
-                header = f"📚 {a} 新增 {len(items)} 条："
-                _send_text(cfg.telegram_bot_token, cfg.telegram_chat_id, header)
-                for it in items:
-                    caption = f"{it['title']}\n{it['url']}"
-                    if not _send_photo(
-                        cfg.telegram_bot_token,
-                        cfg.telegram_chat_id,
-                        it.get("cover", ""),
-                        caption,
-                    ):
-                        _send_text(cfg.telegram_bot_token, cfg.telegram_chat_id, caption)
+                _notify_author_updates(
+                    cfg.telegram_bot_token,
+                    cfg.telegram_chat_id,
+                    a,
+                    items,
+                )
         else:
             _send_text(cfg.telegram_bot_token, cfg.telegram_chat_id, "全都没更新")
 
