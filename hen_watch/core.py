@@ -230,6 +230,11 @@ def _extract_items(html: str, cfg: Config) -> List[Dict[str, str]]:
             tnode = node.select_one(cfg.title_selector)
             if tnode:
                 title = _text(tnode.get_text(" "))
+        if not title and hasattr(node, "select"):
+            for tnode in node.select("[class*='title'], [id*='title']"):
+                title = _text(tnode.get_text(" "))
+                if title:
+                    break
         if not title:
             title = _text(anchor.get_text(" "))
 
@@ -286,15 +291,40 @@ def _diff(prev_items: Dict[str, Dict[str, str]], new_items: List[Dict[str, str]]
 
 
 def _send_text(token: str, chat: str, text: str) -> None:
-    if not token or not chat:
+    if not token or not chat or not text:
         return
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    r = requests.post(url, json={"chat_id": chat, "text": text, "disable_web_page_preview": True}, timeout=30)
+    r = requests.post(
+        url,
+        json={"chat_id": chat, "text": text, "disable_web_page_preview": True},
+        timeout=30,
+    )
     if r.status_code != 200:
         try:
             print("TELEGRAM_SEND_ERROR:", r.status_code, r.text[:300])
         except Exception:
             pass
+
+
+def _send_photo(token: str, chat: str, photo: str, caption: str = "") -> bool:
+    if not token or not chat or not photo:
+        return False
+    payload = {"chat_id": chat, "photo": photo}
+    if caption:
+        payload["caption"] = caption[:1024]
+    url = f"https://api.telegram.org/bot{token}/sendPhoto"
+    try:
+        r = requests.post(url, data=payload, timeout=30)
+    except Exception as exc:  # pragma: no cover - 网络异常只记录
+        print("TELEGRAM_SEND_PHOTO_EXCEPTION:", exc)
+        return False
+    if r.status_code != 200:
+        try:
+            print("TELEGRAM_SEND_PHOTO_ERROR:", r.status_code, r.text[:300])
+        except Exception:
+            pass
+        return False
+    return True
 
 
 def run_once(cfg_path: str = "config.toml") -> int:
@@ -376,6 +406,19 @@ def run_once(cfg_path: str = "config.toml") -> int:
                     else:
                         to_send, msg = chunk, msg[4000:]
                     _send_text(cfg.telegram_bot_token, cfg.telegram_chat_id, to_send)
+
+            for a, items in added_by_author.items():
+                header = f"📚 {a} 新增 {len(items)} 条："
+                _send_text(cfg.telegram_bot_token, cfg.telegram_chat_id, header)
+                for it in items:
+                    caption = f"{it['title']}\n{it['url']}"
+                    if not _send_photo(
+                        cfg.telegram_bot_token,
+                        cfg.telegram_chat_id,
+                        it.get("cover", ""),
+                        caption,
+                    ):
+                        _send_text(cfg.telegram_bot_token, cfg.telegram_chat_id, caption)
         else:
             _send_text(cfg.telegram_bot_token, cfg.telegram_chat_id, "全都没更新")
 
