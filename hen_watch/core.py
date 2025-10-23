@@ -343,6 +343,10 @@ def run_once(cfg_path: str = "config.toml") -> int:
     processed_existing_authors = 0
 
     if authors:
+        # 清除配置中已删除的作者数据
+        for missing_author in [name for name in list(state["authors"].keys()) if name not in authors]:
+            del state["authors"][missing_author]
+
         for name in authors:
             url, items, checksum = _fetch_for_author(name, cfg)
             prev = state["authors"].get(name, {})
